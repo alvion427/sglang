@@ -88,6 +88,13 @@ class TreeNode:
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
 
+        # session-aware retention metadata used by HiMambaRadixCache.
+        # these are eviction-priority hints, not active request locks.
+        self.latest_full_refs = None
+        self.latest_mamba_refs = None
+        self.full_retained_by_nonsession = False
+        self.mamba_retained_by_nonsession = False
+
         # for lru list, invariant:
         # 1. prev has greater last_access_time
         # 2. next has smaller last_access_time
@@ -498,10 +505,14 @@ class MambaRadixCache(BasePrefixCache):
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        prefix_len, mamba_exist = self._insert_helper(
+        prefix_len, mamba_exist, terminal_node = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
-        return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
+        return InsertResult(
+            prefix_len=prefix_len,
+            mamba_exist=mamba_exist,
+            terminal_node=terminal_node,
+        )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
@@ -573,6 +584,7 @@ class MambaRadixCache(BasePrefixCache):
                     prev_prefix_len=req.cache_protected_len,
                 )
             )
+            self._on_cache_finished_insert(req, result)
             mamba_exist = result.mamba_exist
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
@@ -590,6 +602,10 @@ class MambaRadixCache(BasePrefixCache):
             )
 
         self.dec_lock_ref(req.last_node)
+
+    def _on_cache_finished_insert(self, req: Req, result: InsertResult) -> None:
+        """Hook for subclasses that attach retention metadata to inserted nodes."""
+        pass
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -1078,6 +1094,10 @@ class MambaRadixCache(BasePrefixCache):
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.latest_full_refs = (
+            set(child.latest_full_refs) if child.latest_full_refs else None
+        )
+        new_node.full_retained_by_nonsession = child.full_retained_by_nonsession
 
         # child time should be later than parent's time for mamba tombstone
         child.last_access_time = get_last_access_time()
@@ -1106,7 +1126,7 @@ class MambaRadixCache(BasePrefixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
-    ) -> Tuple[int, bool]:
+    ) -> Tuple[int, bool, TreeNode]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
         assert mamba_value is not None, "Mamba value should not be None here."
@@ -1116,7 +1136,7 @@ class MambaRadixCache(BasePrefixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
-            return 0, True
+            return 0, True, node
 
         child_key = key.child_key(self.page_size)
 
@@ -1156,6 +1176,7 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
+            node = new_node
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
@@ -1168,7 +1189,7 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
-        return total_prefix_length, mamba_value_exist
+        return total_prefix_length, mamba_value_exist, node
 
     def _iteratively_delete_tombstone_leaf(
         self, node: TreeNode

@@ -68,6 +68,7 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
+    terminal_node: Any = None
 
 
 @dataclasses.dataclass
