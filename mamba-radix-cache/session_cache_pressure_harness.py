@@ -67,6 +67,12 @@ class RequestResult:
             self.cache_device_tokens + self.cache_host_tokens + self.cache_storage_tokens,
         )
 
+    @property
+    def session_reuse_ratio(self) -> float:
+        if self.expected_cached_tokens <= 0:
+            return 0.0
+        return min(1.0, self.observed_cached_tokens / self.expected_cached_tokens)
+
 
 def repeated_lorem(target_words: int, prefix: str = "") -> str:
     words = [LOREM_WORDS[i % len(LOREM_WORDS)] for i in range(target_words)]
@@ -389,7 +395,7 @@ async def run_session_trajectory(
                 and result.error is None
                 and 200 <= result.status < 300
             ):
-                result.expected_cached_tokens = previous_result.total_tokens
+                result.expected_cached_tokens = max(0, previous_result.total_tokens - 1)
                 if result.observed_cached_tokens < result.expected_cached_tokens:
                     result.cache_warning = (
                         f"expected at least {result.expected_cached_tokens} cached "
@@ -419,6 +425,8 @@ async def run_session_trajectory(
             previous_rid = rid
             if args.simulate_tool_sleeps and sleep_ms > 0:
                 await asyncio.sleep(sleep_ms / 1000.0)
+            if args.session_turn_delay_s > 0 and turn + 1 < args.turns:
+                await asyncio.sleep(args.session_turn_delay_s)
     finally:
         if args.close_sessions:
             await close_session(session, args, session_id)
@@ -432,6 +440,9 @@ async def run_stateless_request(
     request_idx: int,
     header: str,
 ) -> RequestResult:
+    if args.stateless_start_delay_s > 0:
+        await asyncio.sleep(args.stateless_start_delay_s)
+
     rng = random.Random(args.seed + 1000003 + request_idx)
     rid = f"session-cache-pressure-{args.run_id}-stateless-{request_idx:05d}"
     response_text = f"stateless {request_idx} complete"
@@ -479,6 +490,12 @@ def percentile(values: list[float], p: float) -> float:
 def summarize_flat(results: list[RequestResult], warning_count: int = 0) -> dict[str, Any]:
     ok = [r for r in results if r.error is None and 200 <= r.status < 300]
     cache_warnings = [r for r in results if r.cache_warning]
+    reuse_results = [r for r in ok if r.expected_cached_tokens > 0]
+    expected_reuse_tokens = sum(r.expected_cached_tokens for r in reuse_results)
+    observed_reuse_tokens = sum(
+        min(r.observed_cached_tokens, r.expected_cached_tokens)
+        for r in reuse_results
+    )
     latencies = [r.latency_s for r in ok]
     prompt_tokens = sum(r.prompt_tokens for r in ok)
     cached_tokens = sum(r.cached_tokens for r in ok)
@@ -502,6 +519,13 @@ def summarize_flat(results: list[RequestResult], warning_count: int = 0) -> dict
         "cache_host_tokens": host_tokens,
         "cache_storage_tokens": storage_tokens,
         "cache_warnings": len(cache_warnings),
+        "session_expected_reuse_tokens": expected_reuse_tokens,
+        "session_observed_reuse_tokens": observed_reuse_tokens,
+        "session_reuse_ratio": (
+            observed_reuse_tokens / expected_reuse_tokens
+            if expected_reuse_tokens
+            else 0.0
+        ),
     }
     if warning_count:
         flat["latest_eviction_warnings"] = warning_count
@@ -749,6 +773,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-prompt-tokens", type=int, default=256)
     parser.add_argument("--stateless-requests", type=int, default=64)
     parser.add_argument("--stateless-prompt-tokens", type=int, default=4096)
+    parser.add_argument("--stateless-start-delay-s", type=float, default=0)
     parser.add_argument("--target-pressure-tokens", type=int, default=0)
     parser.add_argument("--auto-turns", action="store_true")
     parser.add_argument("--concurrency", type=int, default=32)
@@ -757,6 +782,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tool-sleep-ms", type=int, default=2000)
     parser.add_argument("--tool-sleep-zero-probability", type=float, default=0.0)
     parser.add_argument("--tool-sleep-power", type=float, default=1.0)
+    parser.add_argument("--session-turn-delay-s", type=float, default=0)
     parser.add_argument("--simulate-tool-sleeps", action="store_true", default=True)
     parser.add_argument(
         "--no-simulate-tool-sleeps",

@@ -27,9 +27,14 @@ python mamba-radix-cache/session_cache_pressure_harness.py \
   --model-path Qwen/Qwen3-Next-80B-A3B-Instruct \
   --server-arg=--tp --server-arg=4 \
   --server-arg=--mem-fraction-static --server-arg=0.70 \
+  --server-arg=--enable-hierarchical-cache \
   --sessions 64 \
   --turns 8
 ```
+
+For HiMamba radix cache tests, always launch with
+`--server-arg=--enable-hierarchical-cache`. Without it, SGLang uses
+`MambaRadixCache`, so the run does not exercise `HiMambaRadixCache`.
 
 To compare old-LRU behavior with session-aware behavior, run twice. The harness
 can pass the intended debug environment variables through to the launched server:
@@ -38,6 +43,7 @@ can pass the intended debug environment variables through to the launched server
 python mamba-radix-cache/session_cache_pressure_harness.py \
   --start-server \
   --model-path ... \
+  --server-arg=--enable-hierarchical-cache \
   --old-lru-mode \
   --warn-on-latest-evict
 ```
