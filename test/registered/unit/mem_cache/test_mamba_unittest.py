@@ -454,6 +454,7 @@ class TestMamba(unittest.TestCase):
         tree.session_latest_refs = {}
         tree.disable_session_retention_priority = False
         tree.warn_on_latest_retention_evict = False
+        tree.write_back_session_latest_on_evict = False
         return tree, root
 
     def _make_internal_node(self, parent, key, value):
@@ -720,6 +721,50 @@ class TestMamba(unittest.TestCase):
         self.assertIsNone(leaf.latest_full_refs)
         self.assertIsNone(leaf.latest_mamba_refs)
         self.assertNotIn(leaf.key.child_key(tree.page_size), root.children)
+
+    def test_hi_mamba_latest_session_leaf_can_write_back_on_forced_evict(self):
+        tree, _ = self._make_minimal_hi_mamba_tree()
+        leaf = TreeNode()
+        leaf.value = torch.tensor([1], dtype=torch.int64)
+        tree.write_back_session_latest_on_evict = True
+        tree.cache_controller = type(
+            "CacheController", (), {"write_policy": "write_through"}
+        )()
+        self._set_session_latest_ref(tree, "session-a", leaf)
+
+        calls = []
+
+        def write_backup(node, write_back=False):
+            calls.append(("write_backup", node, write_back))
+            node.host_value = node.value.clone()
+
+        def writing_check(write_back=False):
+            calls.append(("writing_check", write_back))
+
+        def evict_to_host(node):
+            calls.append(("evict_to_host", node))
+            return len(node.value), 0
+
+        def evict_regular(node):
+            calls.append(("evict_regular", node))
+            return len(node.value), 0
+
+        tree.write_backup = write_backup
+        tree.writing_check = writing_check
+        tree._evict_to_host = evict_to_host
+        tree._evict_regular = evict_regular
+
+        evicted_full, evicted_mamba = tree._evict_device_leaf(leaf)
+
+        self.assertEqual((evicted_full, evicted_mamba), (1, 0))
+        self.assertEqual(
+            calls,
+            [
+                ("write_backup", leaf, True),
+                ("writing_check", True),
+                ("evict_to_host", leaf),
+            ],
+        )
 
     def test_hi_mamba_device_mamba_eviction_prefers_stale_over_recency(self):
         tree, root = self._make_minimal_hi_mamba_tree()

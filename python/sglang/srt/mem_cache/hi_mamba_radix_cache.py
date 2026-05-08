@@ -194,6 +194,9 @@ class HiMambaRadixCache(MambaRadixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
+        self.write_back_session_latest_on_evict = (
+            server_args.hicache_write_back_session_latest_on_evict
+        )
         self.load_back_threshold = 10
 
         self.evictable_full_device_leaves: set[TreeNode] = set()
@@ -778,7 +781,13 @@ class HiMambaRadixCache(MambaRadixCache):
         - not backuped + write_through: _evict_regular (delete from tree)
         """
         if not x.backuped:
-            if self.cache_controller.write_policy == "write_back":
+            if (
+                self.cache_controller.write_policy == "write_back"
+                or (
+                    self.write_back_session_latest_on_evict
+                    and x.latest_full_refs
+                )
+            ):
                 self.write_backup(x, write_back=True)
                 self.writing_check(write_back=True)
                 return self._evict_to_host(x)
