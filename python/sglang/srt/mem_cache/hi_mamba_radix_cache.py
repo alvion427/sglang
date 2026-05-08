@@ -786,6 +786,24 @@ class HiMambaRadixCache(MambaRadixCache):
                 return self._evict_regular(x)
         return self._evict_to_host(x)
 
+    def _full_retention_priority(self, node: TreeNode) -> int:
+        if self.disable_session_retention_priority:
+            return 0
+        if node.latest_full_refs:
+            return 2
+        if node.full_retained_by_nonsession:
+            return 1
+        return 0
+
+    def _mamba_retention_priority(self, node: TreeNode) -> int:
+        if self.disable_session_retention_priority:
+            return 0
+        if node.latest_mamba_refs:
+            return 2
+        if node.mamba_retained_by_nonsession:
+            return 1
+        return 0
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -797,17 +815,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if full_num_tokens > 0:
             leaves = list(self.evictable_full_device_leaves)
             eviction_heap = [
-                (
-                    0
-                    if self.disable_session_retention_priority
-                    else 2
-                    if n.latest_full_refs
-                    else 1
-                    if n.full_retained_by_nonsession
-                    else 0,
-                    n.last_access_time,
-                    n,
-                )
+                (self._full_retention_priority(n), n.last_access_time, n)
                 for n in leaves
             ]
             heapq.heapify(eviction_heap)
@@ -826,13 +834,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     heapq.heappush(
                         eviction_heap,
                         (
-                            0
-                            if self.disable_session_retention_priority
-                            else 2
-                            if parent.latest_full_refs
-                            else 1
-                            if parent.full_retained_by_nonsession
-                            else 0,
+                            self._full_retention_priority(parent),
                             parent.last_access_time,
                             parent,
                         ),
@@ -849,17 +851,7 @@ class HiMambaRadixCache(MambaRadixCache):
     def evict_host(self, num_tokens: int):
         """Evict host-resident leaf nodes: free host KV + mamba, delete from tree, cascade."""
         heap = [
-            (
-                0
-                if self.disable_session_retention_priority
-                else 2
-                if n.latest_full_refs
-                else 1
-                if n.full_retained_by_nonsession
-                else 0,
-                n.last_access_time,
-                n,
-            )
+            (self._full_retention_priority(n), n.last_access_time, n)
             for n in self.evictable_full_host_leaves
         ]
         heapq.heapify(heap)
@@ -876,13 +868,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 heapq.heappush(
                     heap,
                     (
-                        0
-                        if self.disable_session_retention_priority
-                        else 2
-                        if x.parent.latest_full_refs
-                        else 1
-                        if x.parent.full_retained_by_nonsession
-                        else 0,
+                        self._full_retention_priority(x.parent),
                         x.parent.last_access_time,
                         x.parent,
                     ),
@@ -902,15 +888,7 @@ class HiMambaRadixCache(MambaRadixCache):
             candidates = [[], [], []]
             node = self.mamba_host_lru_list.get_lru_no_lock()
             while self.mamba_host_lru_list.in_list(node):
-                priority = (
-                    0
-                    if self.disable_session_retention_priority
-                    else 2
-                    if node.latest_mamba_refs
-                    else 1
-                    if node.mamba_retained_by_nonsession
-                    else 0
-                )
+                priority = self._mamba_retention_priority(node)
                 candidates[priority].append(node)
                 node = self.mamba_host_lru_list.get_prev_no_lock(node)
             for bucket in candidates:
@@ -968,15 +946,7 @@ class HiMambaRadixCache(MambaRadixCache):
             candidates = [[], [], []]
             node = self.mamba_lru_list.get_lru_no_lock()
             while self.mamba_lru_list.in_list(node):
-                priority = (
-                    0
-                    if self.disable_session_retention_priority
-                    else 2
-                    if node.latest_mamba_refs
-                    else 1
-                    if node.mamba_retained_by_nonsession
-                    else 0
-                )
+                priority = self._mamba_retention_priority(node)
                 candidates[priority].append(node)
                 node = self.mamba_lru_list.get_prev_no_lock(node)
             for bucket in candidates:
