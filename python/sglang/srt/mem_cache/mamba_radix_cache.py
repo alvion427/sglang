@@ -90,8 +90,8 @@ class TreeNode:
 
         # session-aware retention metadata used by HiMambaRadixCache.
         # these are eviction-priority hints, not active request locks.
-        self.latest_full_refs = None
-        self.latest_mamba_refs = None
+        self.latest_full_session_ids = None
+        self.latest_mamba_session_ids = None
         self.full_retained_by_nonsession = False
         self.mamba_retained_by_nonsession = False
 
@@ -1094,8 +1094,10 @@ class MambaRadixCache(BasePrefixCache):
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
-        new_node.latest_full_refs = (
-            set(child.latest_full_refs) if child.latest_full_refs else None
+        new_node.latest_full_session_ids = (
+            set(child.latest_full_session_ids)
+            if child.latest_full_session_ids
+            else None
         )
         new_node.full_retained_by_nonsession = child.full_retained_by_nonsession
 

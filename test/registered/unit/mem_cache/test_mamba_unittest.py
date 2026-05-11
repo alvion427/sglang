@@ -16,7 +16,6 @@ from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hi_mamba_radix_cache import (
     HiMambaRadixCache,
     HostLRUList,
-    NodeReference,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
@@ -451,7 +450,7 @@ class TestMamba(unittest.TestCase):
         root.value = []
         tree.root_node = root
         tree.page_size = 1
-        tree.session_latest_refs = {}
+        tree.session_latest_nodes = {}
         tree.disable_session_retention_priority = False
         tree.warn_on_latest_retention_evict = False
         tree.write_back_session_latest_on_evict = False
@@ -470,17 +469,13 @@ class TestMamba(unittest.TestCase):
         node.children[child.key.child_key(1)] = child
         return node
 
-    def _refs(self, ref_set):
-        return ref_set or set()
+    def _session_ids(self, session_ids):
+        return session_ids or set()
 
     def _set_session_latest_ref(self, tree, session_id, node):
-        ref = tree.session_latest_refs.get(session_id)
-        if ref is None:
-            tree.session_latest_refs[session_id] = NodeReference(tree, session_id, node)
-        else:
-            ref.retarget(node)
+        tree._set_session_latest_node(session_id, node)
 
-    def test_hi_mamba_node_reference_retarget_and_release(self):
+    def test_hi_mamba_session_latest_retarget_and_release(self):
         tree, root = self._make_minimal_hi_mamba_tree()
         first = TreeNode()
         second = TreeNode()
@@ -499,29 +494,35 @@ class TestMamba(unittest.TestCase):
         third.mamba_value = torch.tensor([30], dtype=torch.int64)
 
         self._set_session_latest_ref(tree, "session-a", second)
-        ref = tree.session_latest_refs["session-a"]
 
-        self.assertIn(ref, self._refs(first.latest_full_refs))
-        self.assertIn(ref, self._refs(second.latest_full_refs))
-        self.assertIn(ref, self._refs(second.latest_mamba_refs))
-        self.assertNotIn(ref, self._refs(first.latest_mamba_refs))
+        self.assertIs(tree.session_latest_nodes["session-a"], second)
+        self.assertIn("session-a", self._session_ids(first.latest_full_session_ids))
+        self.assertIn("session-a", self._session_ids(second.latest_full_session_ids))
+        self.assertIn("session-a", self._session_ids(second.latest_mamba_session_ids))
+        self.assertNotIn(
+            "session-a", self._session_ids(first.latest_mamba_session_ids)
+        )
 
         self._set_session_latest_ref(tree, "session-a", third)
 
-        self.assertIn(ref, self._refs(first.latest_full_refs))
-        self.assertIn(ref, self._refs(second.latest_full_refs))
-        self.assertIn(ref, self._refs(third.latest_full_refs))
-        self.assertNotIn(ref, self._refs(second.latest_mamba_refs))
-        self.assertIn(ref, self._refs(third.latest_mamba_refs))
+        self.assertIs(tree.session_latest_nodes["session-a"], third)
+        self.assertIn("session-a", self._session_ids(first.latest_full_session_ids))
+        self.assertIn("session-a", self._session_ids(second.latest_full_session_ids))
+        self.assertIn("session-a", self._session_ids(third.latest_full_session_ids))
+        self.assertNotIn(
+            "session-a", self._session_ids(second.latest_mamba_session_ids)
+        )
+        self.assertIn("session-a", self._session_ids(third.latest_mamba_session_ids))
 
         tree.release_session("session-a")
 
-        self.assertNotIn("session-a", tree.session_latest_refs)
-        self.assertIsNone(ref.node)
-        self.assertNotIn(ref, self._refs(first.latest_full_refs))
-        self.assertNotIn(ref, self._refs(second.latest_full_refs))
-        self.assertNotIn(ref, self._refs(third.latest_full_refs))
-        self.assertNotIn(ref, self._refs(third.latest_mamba_refs))
+        self.assertNotIn("session-a", tree.session_latest_nodes)
+        self.assertNotIn("session-a", self._session_ids(first.latest_full_session_ids))
+        self.assertNotIn("session-a", self._session_ids(second.latest_full_session_ids))
+        self.assertNotIn("session-a", self._session_ids(third.latest_full_session_ids))
+        self.assertNotIn(
+            "session-a", self._session_ids(third.latest_mamba_session_ids)
+        )
 
     def test_hi_mamba_session_latest_divergent_path_retarget(self):
         tree, root = self._make_minimal_hi_mamba_tree()
@@ -542,15 +543,20 @@ class TestMamba(unittest.TestCase):
         new_tail.mamba_value = torch.tensor([30], dtype=torch.int64)
 
         self._set_session_latest_ref(tree, "session-a", old_tail)
-        ref = tree.session_latest_refs["session-a"]
         self._set_session_latest_ref(tree, "session-a", new_tail)
 
-        self.assertIs(ref.node, new_tail)
-        self.assertIn(ref, self._refs(shared.latest_full_refs))
-        self.assertNotIn(ref, self._refs(old_tail.latest_full_refs))
-        self.assertIn(ref, self._refs(new_tail.latest_full_refs))
-        self.assertNotIn(ref, self._refs(old_tail.latest_mamba_refs))
-        self.assertIn(ref, self._refs(new_tail.latest_mamba_refs))
+        self.assertIs(tree.session_latest_nodes["session-a"], new_tail)
+        self.assertIn("session-a", self._session_ids(shared.latest_full_session_ids))
+        self.assertNotIn(
+            "session-a", self._session_ids(old_tail.latest_full_session_ids)
+        )
+        self.assertIn("session-a", self._session_ids(new_tail.latest_full_session_ids))
+        self.assertNotIn(
+            "session-a", self._session_ids(old_tail.latest_mamba_session_ids)
+        )
+        self.assertIn(
+            "session-a", self._session_ids(new_tail.latest_mamba_session_ids)
+        )
 
     def test_hi_mamba_nonsession_retention_marks_path_and_terminal(self):
         tree, root = self._make_minimal_hi_mamba_tree()
@@ -589,16 +595,19 @@ class TestMamba(unittest.TestCase):
 
         self._set_session_latest_ref(tree, "session-a", child)
         tree._mark_nonsession_retained(child)
-        ref = tree.session_latest_refs["session-a"]
 
         new_parent = MambaRadixCache._split_node(tree, child.key, child, 2)
 
         self.assertIs(child.parent, new_parent)
-        self.assertIs(ref.node, child)
-        self.assertIn(ref, self._refs(new_parent.latest_full_refs))
-        self.assertIn(ref, self._refs(child.latest_full_refs))
-        self.assertNotIn(ref, self._refs(new_parent.latest_mamba_refs))
-        self.assertIn(ref, self._refs(child.latest_mamba_refs))
+        self.assertIs(tree.session_latest_nodes["session-a"], child)
+        self.assertIn(
+            "session-a", self._session_ids(new_parent.latest_full_session_ids)
+        )
+        self.assertIn("session-a", self._session_ids(child.latest_full_session_ids))
+        self.assertNotIn(
+            "session-a", self._session_ids(new_parent.latest_mamba_session_ids)
+        )
+        self.assertIn("session-a", self._session_ids(child.latest_mamba_session_ids))
         self.assertTrue(new_parent.full_retained_by_nonsession)
         self.assertTrue(child.full_retained_by_nonsession)
         self.assertFalse(new_parent.mamba_retained_by_nonsession)
@@ -717,9 +726,9 @@ class TestMamba(unittest.TestCase):
 
         self.assertEqual(evicted_full, 1)
         self.assertEqual(evicted_mamba, 1)
-        self.assertNotIn("session-a", tree.session_latest_refs)
-        self.assertIsNone(leaf.latest_full_refs)
-        self.assertIsNone(leaf.latest_mamba_refs)
+        self.assertNotIn("session-a", tree.session_latest_nodes)
+        self.assertIsNone(leaf.latest_full_session_ids)
+        self.assertIsNone(leaf.latest_mamba_session_ids)
         self.assertNotIn(leaf.key.child_key(tree.page_size), root.children)
 
     def test_hi_mamba_latest_session_leaf_can_write_back_on_forced_evict(self):

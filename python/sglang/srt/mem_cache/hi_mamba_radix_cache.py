@@ -86,31 +86,6 @@ class HostLRUList(LRUList):
         self._remove_node(node)
 
 
-class NodeReference:
-    """Latest-session reference to a HiMamba radix terminal node."""
-
-    def __init__(self, cache: "HiMambaRadixCache", session_id: str, node: TreeNode):
-        self.cache = cache
-        self.session_id = session_id
-        self.node: Optional[TreeNode] = None
-        self.retarget(node)
-
-    def retarget(self, new_node: TreeNode) -> None:
-        if self.node is new_node:
-            return
-        if self.node is not None:
-            self.cache._detach_node_reference(self)
-        self.node = new_node
-        self.cache._attach_node_reference(self)
-
-    def release(self) -> None:
-        if self.node is not None:
-            self.cache._detach_node_reference(self)
-            self.node = None
-        if self.cache.session_latest_refs.get(self.session_id) is self:
-            del self.cache.session_latest_refs[self.session_id]
-
-
 class HiMambaRadixCache(MambaRadixCache):
     """Hierarchical cache for hybrid Mamba models."""
 
@@ -202,7 +177,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_device_leaves: set[TreeNode] = set()
         self.evictable_full_host_leaves: set[TreeNode] = set()
         self.mamba_host_lru_list = HostLRUList()
-        self.session_latest_refs: Dict[str, NodeReference] = {}
+        self.session_latest_nodes: Dict[str, TreeNode] = {}
         self.disable_session_retention_priority = (
             os.getenv("SGLANG_HIMAMBA_DISABLE_SESSION_RETENTION_PRIORITY") == "1"
         )
@@ -232,9 +207,8 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
         self.mamba_host_lru_list = HostLRUList()
-        for ref in list(self.session_latest_refs.values()):
-            ref.release()
-        self.session_latest_refs.clear()
+        for session_id in list(self.session_latest_nodes):
+            self.release_session(session_id)
         logger.info(
             "HiMambaRadixCache reset completed: host_kv_available=%s host_mamba_available=%s",
             self.full_kv_pool_host.available_size(),
@@ -534,39 +508,44 @@ class HiMambaRadixCache(MambaRadixCache):
             return
         self.evictable_full_host_leaves.add(node)
 
-    def _attach_node_reference(self, ref: NodeReference) -> None:
-        node = ref.node
-        assert node is not None
-        if node.latest_mamba_refs is None:
-            node.latest_mamba_refs = set()
-        node.latest_mamba_refs.add(ref)
+    def _set_session_latest_node(self, session_id: str, node: TreeNode) -> None:
+        old_node = self.session_latest_nodes.get(session_id)
+        if old_node is node:
+            return
+        if old_node is not None:
+            self._detach_session_latest_node(session_id, old_node)
+        self.session_latest_nodes[session_id] = node
+        self._attach_session_latest_node(session_id, node)
+
+    def _attach_session_latest_node(self, session_id: str, node: TreeNode) -> None:
+        if node.latest_mamba_session_ids is None:
+            node.latest_mamba_session_ids = set()
+        node.latest_mamba_session_ids.add(session_id)
         path_node = node
         while path_node is not None and path_node != self.root_node:
-            if path_node.latest_full_refs is None:
-                path_node.latest_full_refs = set()
-            path_node.latest_full_refs.add(ref)
+            if path_node.latest_full_session_ids is None:
+                path_node.latest_full_session_ids = set()
+            path_node.latest_full_session_ids.add(session_id)
             path_node = path_node.parent
 
-    def _detach_node_reference(self, ref: NodeReference) -> None:
-        node = ref.node
-        if node is None:
-            return
-        if node.latest_mamba_refs is not None:
-            node.latest_mamba_refs.discard(ref)
-            if not node.latest_mamba_refs:
-                node.latest_mamba_refs = None
+    def _detach_session_latest_node(self, session_id: str, node: TreeNode) -> None:
+        if node.latest_mamba_session_ids is not None:
+            node.latest_mamba_session_ids.discard(session_id)
+            if not node.latest_mamba_session_ids:
+                node.latest_mamba_session_ids = None
         path_node = node
         while path_node is not None and path_node != self.root_node:
-            if path_node.latest_full_refs is not None:
-                path_node.latest_full_refs.discard(ref)
-                if not path_node.latest_full_refs:
-                    path_node.latest_full_refs = None
+            if path_node.latest_full_session_ids is not None:
+                path_node.latest_full_session_ids.discard(session_id)
+                if not path_node.latest_full_session_ids:
+                    path_node.latest_full_session_ids = None
             path_node = path_node.parent
 
     def _mark_nonsession_retained(self, node: TreeNode) -> None:
         # stateless requests have no later close/advance signal, so mark useful
         # matches as retained when they are observed.
-        if node is None or node == self.root_node:
+        assert node is not None
+        if node == self.root_node:
             return
         if node.mamba_value is not None or node.mamba_host_value is not None:
             node.mamba_retained_by_nonsession = True
@@ -577,29 +556,33 @@ class HiMambaRadixCache(MambaRadixCache):
             path_node = path_node.parent
 
     def _drop_mamba_retention(self, node: TreeNode) -> None:
-        if node.latest_mamba_refs is not None:
+        if node.latest_mamba_session_ids is not None:
             if self.warn_on_latest_retention_evict:
                 logger.warning(
-                    "evicting latest-session mamba retention: node_id=%s ref_count=%s",
+                    "evicting latest-session mamba retention: node_id=%s session_count=%s",
                     node.id,
-                    len(node.latest_mamba_refs),
+                    len(node.latest_mamba_session_ids),
                 )
-            for ref in list(node.latest_mamba_refs):
-                ref.release()
-            node.latest_mamba_refs = None
+            for session_id in list(node.latest_mamba_session_ids):
+                assert self.session_latest_nodes[session_id] is node
+                del self.session_latest_nodes[session_id]
+                self._detach_session_latest_node(session_id, node)
+            node.latest_mamba_session_ids = None
         node.mamba_retained_by_nonsession = False
 
     def _drop_full_retention(self, node: TreeNode) -> None:
-        if node.latest_full_refs is not None:
+        if node.latest_full_session_ids is not None:
             if self.warn_on_latest_retention_evict:
                 logger.warning(
-                    "evicting latest-session full retention: node_id=%s ref_count=%s",
+                    "evicting latest-session full retention: node_id=%s session_count=%s",
                     node.id,
-                    len(node.latest_full_refs),
+                    len(node.latest_full_session_ids),
                 )
-            for ref in list(node.latest_full_refs):
-                ref.release()
-            node.latest_full_refs = None
+            for session_id in list(node.latest_full_session_ids):
+                latest_node = self.session_latest_nodes[session_id]
+                del self.session_latest_nodes[session_id]
+                self._detach_session_latest_node(session_id, latest_node)
+            node.latest_full_session_ids = None
         node.full_retained_by_nonsession = False
 
     def _free_device_mamba(self, node: TreeNode) -> int:
@@ -785,7 +768,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.cache_controller.write_policy == "write_back"
                 or (
                     self.write_back_session_latest_on_evict
-                    and x.latest_full_refs
+                    and x.latest_full_session_ids
                 )
             ):
                 self.write_backup(x, write_back=True)
@@ -798,7 +781,7 @@ class HiMambaRadixCache(MambaRadixCache):
     def _full_retention_priority(self, node: TreeNode) -> int:
         if self.disable_session_retention_priority:
             return 0
-        if node.latest_full_refs:
+        if node.latest_full_session_ids:
             return 2
         if node.full_retained_by_nonsession:
             return 1
@@ -807,7 +790,7 @@ class HiMambaRadixCache(MambaRadixCache):
     def _mamba_retention_priority(self, node: TreeNode) -> int:
         if self.disable_session_retention_priority:
             return 0
-        if node.latest_mamba_refs:
+        if node.latest_mamba_session_ids:
             return 2
         if node.mamba_retained_by_nonsession:
             return 1
@@ -1114,7 +1097,8 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def _on_cache_finished_insert(self, req, result: InsertResult) -> None:
         terminal_node = result.terminal_node
-        if terminal_node is None or terminal_node == self.root_node:
+        assert terminal_node is not None
+        if terminal_node == self.root_node:
             return
 
         if req.session is None:
@@ -1122,13 +1106,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self._mark_nonsession_retained(terminal_node)
         else:
             session_id = req.session.session_id
-            ref = self.session_latest_refs.get(session_id)
-            if ref is None:
-                self.session_latest_refs[session_id] = NodeReference(
-                    self, session_id, terminal_node
-                )
-            else:
-                ref.retarget(terminal_node)
+            self._set_session_latest_node(session_id, terminal_node)
             if self.debug_session_cache:
                 logger.info(
                     "hi-mamba session cache finish: rid=%s session_id=%s "
@@ -1139,9 +1117,9 @@ class HiMambaRadixCache(MambaRadixCache):
                 )
 
     def release_session(self, session_id: str) -> None:
-        ref = self.session_latest_refs.pop(session_id, None)
-        if ref is not None:
-            ref.release()
+        node = self.session_latest_nodes.pop(session_id, None)
+        if node is not None:
+            self._detach_session_latest_node(session_id, node)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
@@ -1338,8 +1316,10 @@ class HiMambaRadixCache(MambaRadixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
-        new_node.latest_full_refs = (
-            set(child.latest_full_refs) if child.latest_full_refs else None
+        new_node.latest_full_session_ids = (
+            set(child.latest_full_session_ids)
+            if child.latest_full_session_ids
+            else None
         )
         new_node.full_retained_by_nonsession = child.full_retained_by_nonsession
 
