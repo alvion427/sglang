@@ -169,8 +169,8 @@ class HiMambaRadixCache(MambaRadixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.write_back_session_latest_on_evict = (
-            server_args.hicache_write_back_session_latest_on_evict
+        self.backup_session_latest_on_insert = (
+            server_args.hicache_backup_session_latest_on_insert
         )
         self.load_back_threshold = 10
 
@@ -764,13 +764,7 @@ class HiMambaRadixCache(MambaRadixCache):
         - not backuped + write_through: _evict_regular (delete from tree)
         """
         if not x.backuped:
-            if (
-                self.cache_controller.write_policy == "write_back"
-                or (
-                    self.write_back_session_latest_on_evict
-                    and x.latest_full_session_ids
-                )
-            ):
+            if self.cache_controller.write_policy == "write_back":
                 self.write_backup(x, write_back=True)
                 self.writing_check(write_back=True)
                 return self._evict_to_host(x)
@@ -1107,6 +1101,10 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             session_id = req.session.session_id
             self._set_session_latest_node(session_id, terminal_node)
+            if self.backup_session_latest_on_insert and not terminal_node.backuped:
+                # nodes that are part of a session are very likely to be re-used so (optionally) back
+                # them up to host memory immediately
+                self.write_backup(terminal_node)
             if self.debug_session_cache:
                 logger.info(
                     "hi-mamba session cache finish: rid=%s session_id=%s "

@@ -453,7 +453,8 @@ class TestMamba(unittest.TestCase):
         tree.session_latest_nodes = {}
         tree.disable_session_retention_priority = False
         tree.warn_on_latest_retention_evict = False
-        tree.write_back_session_latest_on_evict = False
+        tree.backup_session_latest_on_insert = False
+        tree.debug_session_cache = False
         return tree, root
 
     def _make_internal_node(self, parent, key, value):
@@ -731,15 +732,14 @@ class TestMamba(unittest.TestCase):
         self.assertIsNone(leaf.latest_mamba_session_ids)
         self.assertNotIn(leaf.key.child_key(tree.page_size), root.children)
 
-    def test_hi_mamba_latest_session_leaf_can_write_back_on_forced_evict(self):
-        tree, _ = self._make_minimal_hi_mamba_tree()
+    def test_hi_mamba_latest_session_insert_can_start_host_backup(self):
+        tree, root = self._make_minimal_hi_mamba_tree()
         leaf = TreeNode()
+        leaf.parent = root
+        leaf.key = RadixKey([1])
         leaf.value = torch.tensor([1], dtype=torch.int64)
-        tree.write_back_session_latest_on_evict = True
-        tree.cache_controller = type(
-            "CacheController", (), {"write_policy": "write_through"}
-        )()
-        self._set_session_latest_ref(tree, "session-a", leaf)
+        root.children[leaf.key.child_key(tree.page_size)] = leaf
+        tree.backup_session_latest_on_insert = True
 
         calls = []
 
@@ -747,33 +747,63 @@ class TestMamba(unittest.TestCase):
             calls.append(("write_backup", node, write_back))
             node.host_value = node.value.clone()
 
-        def writing_check(write_back=False):
-            calls.append(("writing_check", write_back))
-
-        def evict_to_host(node):
-            calls.append(("evict_to_host", node))
-            return len(node.value), 0
-
-        def evict_regular(node):
-            calls.append(("evict_regular", node))
-            return len(node.value), 0
-
         tree.write_backup = write_backup
-        tree.writing_check = writing_check
-        tree._evict_to_host = evict_to_host
-        tree._evict_regular = evict_regular
+        req = type(
+            "Req",
+            (),
+            {
+                "session": type("Session", (), {"session_id": "session-a"})(),
+                "rid": "rid-a",
+            },
+        )()
 
-        evicted_full, evicted_mamba = tree._evict_device_leaf(leaf)
+        tree._on_cache_finished_insert(req, type("Result", (), {"terminal_node": leaf})())
 
-        self.assertEqual((evicted_full, evicted_mamba), (1, 0))
-        self.assertEqual(
-            calls,
-            [
-                ("write_backup", leaf, True),
-                ("writing_check", True),
-                ("evict_to_host", leaf),
-            ],
-        )
+        self.assertIs(tree.session_latest_nodes["session-a"], leaf)
+        self.assertEqual(calls, [("write_backup", leaf, False)])
+
+    def test_hi_mamba_evict_to_host_preserves_retention_priority(self):
+        tree, root = self._make_minimal_hi_mamba_tree()
+        leaf = TreeNode()
+        leaf.parent = root
+        leaf.key = RadixKey([1])
+        leaf.value = torch.tensor([1], dtype=torch.int64)
+        leaf.mamba_value = torch.tensor([10], dtype=torch.int64)
+        leaf.host_value = torch.tensor([1], dtype=torch.int64)
+        root.children[leaf.key.child_key(tree.page_size)] = leaf
+
+        class RecordingPool:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, value):
+                self.freed.append(value.clone())
+
+        class RecordingCacheController:
+            def __init__(self):
+                self.device_evictions = []
+
+            def evict_device(self, value):
+                self.device_evictions.append(value.clone())
+
+        tree.req_to_token_pool = type("ReqPool", (), {"mamba_pool": RecordingPool()})()
+        tree.cache_controller = RecordingCacheController()
+        tree.full_lru_list = LRUList(mamba=False)
+        tree.mamba_lru_list = LRUList(mamba=True)
+        tree.full_lru_list.insert_mru(leaf)
+        tree.mamba_lru_list.insert_mru(leaf)
+        tree.full_evictable_size_ = 1
+        tree.mamba_evictable_size_ = 1
+        tree.evictable_full_device_leaves = {leaf}
+        tree.evictable_full_host_leaves = set()
+        self._set_session_latest_ref(tree, "session-a", leaf)
+
+        evicted_full, evicted_mamba = tree._evict_to_host(leaf)
+
+        self.assertEqual((evicted_full, evicted_mamba), (1, 1))
+        self.assertIs(tree.session_latest_nodes["session-a"], leaf)
+        self.assertIn("session-a", self._session_ids(leaf.latest_full_session_ids))
+        self.assertIn("session-a", self._session_ids(leaf.latest_mamba_session_ids))
 
     def test_hi_mamba_device_mamba_eviction_prefers_stale_over_recency(self):
         tree, root = self._make_minimal_hi_mamba_tree()

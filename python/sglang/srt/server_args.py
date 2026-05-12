@@ -594,7 +594,7 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
-    hicache_write_back_session_latest_on_evict: bool = False
+    hicache_backup_session_latest_on_insert: bool = False
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
@@ -5789,11 +5789,11 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
-            "--hicache-write-back-session-latest-on-evict",
+            "--hicache-backup-session-latest-on-insert",
             action="store_true",
             help=(
-                "Synchronously back up latest session cache nodes to host before "
-                "forced device eviction."
+                "Start an async host backup for each newly inserted latest session "
+                "cache node."
             ),
         )
         parser.add_argument(
