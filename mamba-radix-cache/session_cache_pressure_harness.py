@@ -395,7 +395,10 @@ async def run_session_trajectory(
                 and result.error is None
                 and 200 <= result.status < 300
             ):
-                result.expected_cached_tokens = max(0, previous_result.total_tokens - 1)
+                result.expected_cached_tokens = max(
+                    0,
+                    previous_result.prompt_tokens + previous_result.completion_tokens,
+                )
                 if result.observed_cached_tokens < result.expected_cached_tokens:
                     result.cache_warning = (
                         f"expected at least {result.expected_cached_tokens} cached "
@@ -487,7 +490,10 @@ def percentile(values: list[float], p: float) -> float:
     return values[idx]
 
 
-def summarize_flat(results: list[RequestResult], warning_count: int = 0) -> dict[str, Any]:
+def summarize_flat(
+    results: list[RequestResult],
+    warning_count: int = 0,
+) -> dict[str, Any]:
     ok = [r for r in results if r.error is None and 200 <= r.status < 300]
     cache_warnings = [r for r in results if r.cache_warning]
     reuse_results = [r for r in ok if r.expected_cached_tokens > 0]
@@ -761,28 +767,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose-requests", action="store_true")
     parser.add_argument(
         "--eviction-warning-regex",
-        default=r"latest.*evict|evict.*latest|session_latest.*evict",
+        default=r"evicting latest-session (mamba|full) retention:",
     )
     parser.add_argument("--server-log-file", type=Path, default=None)
 
-    parser.add_argument("--sessions", type=int, default=32)
-    parser.add_argument("--turns", type=int, default=6)
-    parser.add_argument("--common-headers", type=int, default=4)
-    parser.add_argument("--common-header-tokens", type=int, default=2048)
-    parser.add_argument("--session-seed-tokens", type=int, default=1024)
-    parser.add_argument("--turn-prompt-tokens", type=int, default=256)
-    parser.add_argument("--stateless-requests", type=int, default=64)
-    parser.add_argument("--stateless-prompt-tokens", type=int, default=4096)
-    parser.add_argument("--stateless-start-delay-s", type=float, default=0)
+    parser.add_argument("--sessions", type=int, default=16)
+    parser.add_argument("--turns", type=int, default=5)
+    parser.add_argument("--common-headers", type=int, default=2)
+    parser.add_argument("--common-header-tokens", type=int, default=256)
+    parser.add_argument("--session-seed-tokens", type=int, default=128)
+    parser.add_argument("--turn-prompt-tokens", type=int, default=64)
+    parser.add_argument("--stateless-requests", type=int, default=8)
+    parser.add_argument("--stateless-prompt-tokens", type=int, default=512)
+    parser.add_argument("--stateless-start-delay-s", type=float, default=1)
     parser.add_argument("--target-pressure-tokens", type=int, default=0)
     parser.add_argument("--auto-turns", action="store_true")
-    parser.add_argument("--concurrency", type=int, default=32)
-    parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--max-tool-calls", type=int, default=3)
-    parser.add_argument("--tool-sleep-ms", type=int, default=2000)
-    parser.add_argument("--tool-sleep-zero-probability", type=float, default=0.0)
-    parser.add_argument("--tool-sleep-power", type=float, default=1.0)
-    parser.add_argument("--session-turn-delay-s", type=float, default=0)
+    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument("--max-tool-calls", type=int, default=1)
+    parser.add_argument("--tool-sleep-ms", type=int, default=20000)
+    parser.add_argument("--tool-sleep-zero-probability", type=float, default=0.5)
+    parser.add_argument("--tool-sleep-power", type=float, default=4.0)
+    parser.add_argument("--session-turn-delay-s", type=float, default=1)
     parser.add_argument("--simulate-tool-sleeps", action="store_true", default=True)
     parser.add_argument(
         "--no-simulate-tool-sleeps",
