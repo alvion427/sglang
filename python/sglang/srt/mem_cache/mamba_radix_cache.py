@@ -89,7 +89,15 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
 
         # session-aware retention metadata used by HiMambaRadixCache.
-        # these are eviction-priority hints, not active request locks.
+        # these are eviction-priority hints, not active request locks, and are
+        # orthogonal to residency. eviction moves or frees memory under pressure;
+        # retention only decides which evictable nodes should be chosen first.
+        #
+        # priority states:
+        # - high: node is part of the latest turn for one or more sessions.
+        # - normal: node was used by a nonsession request. This is sticky because
+        #   there is no nonsession lifecycle event that can release it.
+        # - low: node was only used by sessions and is no longer latest.
         self.latest_full_session_ids = None
         self.latest_mamba_session_ids = None
         self.full_retained_by_nonsession = False
