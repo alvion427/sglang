@@ -470,13 +470,12 @@ class TestMamba(unittest.TestCase):
         node.children[child.key.child_key(1)] = child
         return node
 
-    def _session_ids(self, session_ids):
-        return session_ids or set()
-
-    def _set_session_latest_ref(self, tree, session_id, node):
+    def _set_session_latest_node(self, tree, session_id, node):
         tree._set_session_latest_node(session_id, node)
 
     def test_hi_mamba_session_latest_retarget_and_release(self):
+        # Invariant: advancing a session moves terminal Mamba retention to the new
+        # node while preserving full-KV retention on the shared ancestor path.
         tree, root = self._make_minimal_hi_mamba_tree()
         first = TreeNode()
         second = TreeNode()
@@ -494,38 +493,34 @@ class TestMamba(unittest.TestCase):
         second.mamba_value = torch.tensor([20], dtype=torch.int64)
         third.mamba_value = torch.tensor([30], dtype=torch.int64)
 
-        self._set_session_latest_ref(tree, "session-a", second)
+        self._set_session_latest_node(tree, "session-a", second)
 
         self.assertIs(tree.session_latest_nodes["session-a"], second)
-        self.assertIn("session-a", self._session_ids(first.latest_full_session_ids))
-        self.assertIn("session-a", self._session_ids(second.latest_full_session_ids))
-        self.assertIn("session-a", self._session_ids(second.latest_mamba_session_ids))
-        self.assertNotIn(
-            "session-a", self._session_ids(first.latest_mamba_session_ids)
-        )
+        self.assertEqual(first.latest_full_session_ids, {"session-a"})
+        self.assertEqual(second.latest_full_session_ids, {"session-a"})
+        self.assertEqual(second.latest_mamba_session_ids, {"session-a"})
+        self.assertIsNone(first.latest_mamba_session_ids)
 
-        self._set_session_latest_ref(tree, "session-a", third)
+        self._set_session_latest_node(tree, "session-a", third)
 
         self.assertIs(tree.session_latest_nodes["session-a"], third)
-        self.assertIn("session-a", self._session_ids(first.latest_full_session_ids))
-        self.assertIn("session-a", self._session_ids(second.latest_full_session_ids))
-        self.assertIn("session-a", self._session_ids(third.latest_full_session_ids))
-        self.assertNotIn(
-            "session-a", self._session_ids(second.latest_mamba_session_ids)
-        )
-        self.assertIn("session-a", self._session_ids(third.latest_mamba_session_ids))
+        self.assertEqual(first.latest_full_session_ids, {"session-a"})
+        self.assertEqual(second.latest_full_session_ids, {"session-a"})
+        self.assertEqual(third.latest_full_session_ids, {"session-a"})
+        self.assertIsNone(second.latest_mamba_session_ids)
+        self.assertEqual(third.latest_mamba_session_ids, {"session-a"})
 
         tree.release_session("session-a")
 
         self.assertNotIn("session-a", tree.session_latest_nodes)
-        self.assertNotIn("session-a", self._session_ids(first.latest_full_session_ids))
-        self.assertNotIn("session-a", self._session_ids(second.latest_full_session_ids))
-        self.assertNotIn("session-a", self._session_ids(third.latest_full_session_ids))
-        self.assertNotIn(
-            "session-a", self._session_ids(third.latest_mamba_session_ids)
-        )
+        self.assertIsNone(first.latest_full_session_ids)
+        self.assertIsNone(second.latest_full_session_ids)
+        self.assertIsNone(third.latest_full_session_ids)
+        self.assertIsNone(third.latest_mamba_session_ids)
 
     def test_hi_mamba_session_latest_divergent_path_retarget(self):
+        # Invariant: retargeting a session to a divergent path releases retention
+        # from the old unique tail but keeps retention on the shared prefix.
         tree, root = self._make_minimal_hi_mamba_tree()
         shared = TreeNode()
         old_tail = TreeNode()
@@ -543,23 +538,19 @@ class TestMamba(unittest.TestCase):
         old_tail.mamba_value = torch.tensor([20], dtype=torch.int64)
         new_tail.mamba_value = torch.tensor([30], dtype=torch.int64)
 
-        self._set_session_latest_ref(tree, "session-a", old_tail)
-        self._set_session_latest_ref(tree, "session-a", new_tail)
+        self._set_session_latest_node(tree, "session-a", old_tail)
+        self._set_session_latest_node(tree, "session-a", new_tail)
 
         self.assertIs(tree.session_latest_nodes["session-a"], new_tail)
-        self.assertIn("session-a", self._session_ids(shared.latest_full_session_ids))
-        self.assertNotIn(
-            "session-a", self._session_ids(old_tail.latest_full_session_ids)
-        )
-        self.assertIn("session-a", self._session_ids(new_tail.latest_full_session_ids))
-        self.assertNotIn(
-            "session-a", self._session_ids(old_tail.latest_mamba_session_ids)
-        )
-        self.assertIn(
-            "session-a", self._session_ids(new_tail.latest_mamba_session_ids)
-        )
+        self.assertEqual(shared.latest_full_session_ids, {"session-a"})
+        self.assertIsNone(old_tail.latest_full_session_ids)
+        self.assertEqual(new_tail.latest_full_session_ids, {"session-a"})
+        self.assertIsNone(old_tail.latest_mamba_session_ids)
+        self.assertEqual(new_tail.latest_mamba_session_ids, {"session-a"})
 
     def test_hi_mamba_nonsession_retention_marks_path_and_terminal(self):
+        # Invariant: a nonsession cache use marks the full-KV path but marks
+        # Mamba retention only at the terminal state.
         tree, root = self._make_minimal_hi_mamba_tree()
         first = TreeNode()
         second = TreeNode()
@@ -581,9 +572,13 @@ class TestMamba(unittest.TestCase):
         self.assertTrue(second.mamba_retained_by_nonsession)
 
     def test_mamba_split_propagates_retention_metadata(self):
+        # Invariant: splitting a device node keeps full-KV retention on both
+        # pieces, while terminal Mamba retention remains on the suffix child.
         tree, root = self._make_minimal_hi_mamba_tree()
         tree.full_lru_list = LRUList(mamba=False)
         tree.mamba_lru_list = LRUList(mamba=True)
+        tree.evictable_full_device_leaves = set()
+        tree.evictable_full_host_leaves = set()
 
         child = TreeNode()
         child.parent = root
@@ -593,43 +588,73 @@ class TestMamba(unittest.TestCase):
         root.children[child.key.child_key(tree.page_size)] = child
         tree.full_lru_list.insert_mru(child)
         tree.mamba_lru_list.insert_mru(child)
+        tree.evictable_full_device_leaves.add(child)
 
-        self._set_session_latest_ref(tree, "session-a", child)
+        self._set_session_latest_node(tree, "session-a", child)
         tree._mark_nonsession_retained(child)
 
-        new_parent = MambaRadixCache._split_node(tree, child.key, child, 2)
+        new_parent = tree._split_node(child.key, child, 2)
 
         self.assertIs(child.parent, new_parent)
         self.assertIs(tree.session_latest_nodes["session-a"], child)
-        self.assertIn(
-            "session-a", self._session_ids(new_parent.latest_full_session_ids)
-        )
-        self.assertIn("session-a", self._session_ids(child.latest_full_session_ids))
-        self.assertNotIn(
-            "session-a", self._session_ids(new_parent.latest_mamba_session_ids)
-        )
-        self.assertIn("session-a", self._session_ids(child.latest_mamba_session_ids))
+        self.assertEqual(new_parent.latest_full_session_ids, {"session-a"})
+        self.assertEqual(child.latest_full_session_ids, {"session-a"})
+        self.assertIsNone(new_parent.latest_mamba_session_ids)
+        self.assertEqual(child.latest_mamba_session_ids, {"session-a"})
         self.assertTrue(new_parent.full_retained_by_nonsession)
         self.assertTrue(child.full_retained_by_nonsession)
         self.assertFalse(new_parent.mamba_retained_by_nonsession)
         self.assertTrue(child.mamba_retained_by_nonsession)
 
-    def test_hi_mamba_device_full_eviction_prefers_stale_over_recency(self):
+    def test_hi_mamba_evicted_split_propagates_retention_metadata(self):
+        # Invariant: splitting a host-resident node has the same retention
+        # semantics as a device split, and also splits the host KV span.
         tree, root = self._make_minimal_hi_mamba_tree()
-        latest = TreeNode()
-        nonsession = TreeNode()
-        stale = TreeNode()
+        tree.evictable_full_host_leaves = set()
 
-        for idx, node in enumerate([latest, nonsession, stale], start=1):
+        child = TreeNode()
+        child.parent = root
+        child.key = RadixKey([1, 2, 3, 4])
+        child.value = None
+        child.host_value = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        child.mamba_value = None
+        child.mamba_host_value = torch.tensor([40], dtype=torch.int64)
+        root.children[child.key.child_key(tree.page_size)] = child
+        tree.evictable_full_host_leaves.add(child)
+
+        self._set_session_latest_node(tree, "session-a", child)
+        tree._mark_nonsession_retained(child)
+
+        new_parent = tree._split_node(child.key, child, 2)
+
+        self.assertIs(child.parent, new_parent)
+        self.assertIs(tree.session_latest_nodes["session-a"], child)
+        self.assertEqual(new_parent.latest_full_session_ids, {"session-a"})
+        self.assertEqual(child.latest_full_session_ids, {"session-a"})
+        self.assertIsNone(new_parent.latest_mamba_session_ids)
+        self.assertEqual(child.latest_mamba_session_ids, {"session-a"})
+        self.assertTrue(torch.equal(new_parent.host_value, torch.tensor([1, 2])))
+        self.assertTrue(torch.equal(child.host_value, torch.tensor([3, 4])))
+        self.assertTrue(new_parent.full_retained_by_nonsession)
+        self.assertTrue(child.full_retained_by_nonsession)
+        self.assertFalse(new_parent.mamba_retained_by_nonsession)
+        self.assertTrue(child.mamba_retained_by_nonsession)
+
+    def test_hi_mamba_device_full_eviction_priority_order(self):
+        # Invariant: device KV eviction chooses stale session data first,
+        # sessionless data second, and latest-session data last.
+        tree, root = self._make_minimal_hi_mamba_tree()
+        stale = TreeNode()
+        nonsession = TreeNode()
+        latest = TreeNode()
+
+        for idx, node in enumerate([stale, nonsession, latest], start=1):
             node.parent = root
             node.key = RadixKey([idx])
             node.value = torch.tensor([idx], dtype=torch.int64)
             node.last_access_time = idx
 
-        latest.last_access_time = 1
-        nonsession.last_access_time = 2
-        stale.last_access_time = 3
-        self._set_session_latest_ref(tree, "session-a", latest)
+        self._set_session_latest_node(tree, "session-a", latest)
         nonsession.full_retained_by_nonsession = True
 
         evicted = []
@@ -643,50 +668,48 @@ class TestMamba(unittest.TestCase):
         tree.evictable_full_device_leaves = {latest, nonsession, stale}
         tree._evict_device_leaf = evict_device_leaf
 
-        result = HiMambaRadixCache.evict(tree, EvictParams(num_tokens=1))
+        result = HiMambaRadixCache.evict(tree, EvictParams(num_tokens=2))
 
-        self.assertEqual(result.num_tokens_evicted, 1)
-        self.assertEqual(evicted, [stale])
+        self.assertEqual(result.num_tokens_evicted, 2)
+        self.assertEqual(evicted, [stale, nonsession])
+        self.assertIn(latest, tree.evictable_full_device_leaves)
 
-    def test_hi_mamba_device_full_eviction_stale_wave_preserves_retained(self):
+    def test_hi_mamba_host_full_eviction_priority_order(self):
+        # Invariant: host KV eviction uses the same retention ordering as device
+        # KV eviction: stale, then sessionless, then latest-session.
         tree, root = self._make_minimal_hi_mamba_tree()
-        latest = TreeNode()
+        stale = TreeNode()
         nonsession = TreeNode()
-        stale_a = TreeNode()
-        stale_b = TreeNode()
+        latest = TreeNode()
 
-        for idx, node in enumerate([latest, nonsession, stale_a, stale_b], start=1):
+        for idx, node in enumerate([stale, nonsession, latest], start=1):
             node.parent = root
             node.key = RadixKey([idx])
-            node.value = torch.tensor([idx], dtype=torch.int64)
+            node.value = None
+            node.host_value = torch.tensor([idx], dtype=torch.int64)
             node.last_access_time = idx
 
-        latest.last_access_time = 1
-        nonsession.last_access_time = 2
-        stale_a.last_access_time = 3
-        stale_b.last_access_time = 4
-        self._set_session_latest_ref(tree, "session-a", latest)
+        self._set_session_latest_node(tree, "session-a", latest)
         nonsession.full_retained_by_nonsession = True
 
         evicted = []
 
-        def evict_device_leaf(node):
+        def evict_host_leaf(node):
             evicted.append(node)
-            tree.evictable_full_device_leaves.remove(node)
-            return len(node.value), 0
+            tree.evictable_full_host_leaves.remove(node)
+            return len(node.host_value)
 
-        tree.disable = False
-        tree.evictable_full_device_leaves = {latest, nonsession, stale_a, stale_b}
-        tree._evict_device_leaf = evict_device_leaf
+        tree.evictable_full_host_leaves = {latest, nonsession, stale}
+        tree._evict_host_leaf = evict_host_leaf
 
-        result = HiMambaRadixCache.evict(tree, EvictParams(num_tokens=2))
+        HiMambaRadixCache.evict_host(tree, 2)
 
-        self.assertEqual(result.num_tokens_evicted, 2)
-        self.assertEqual(evicted, [stale_a, stale_b])
-        self.assertIn(latest, tree.evictable_full_device_leaves)
-        self.assertIn(nonsession, tree.evictable_full_device_leaves)
+        self.assertEqual(evicted, [stale, nonsession])
+        self.assertIn(latest, tree.evictable_full_host_leaves)
 
     def test_hi_mamba_forced_latest_leaf_eviction_clears_session_ref(self):
+        # Invariant: if hard pressure deletes a latest-session leaf from the
+        # tree, the session map and node metadata are cleared together.
         tree, root = self._make_minimal_hi_mamba_tree()
         leaf = TreeNode()
         leaf.parent = root
@@ -721,7 +744,7 @@ class TestMamba(unittest.TestCase):
         tree.mamba_evictable_size_ = 1
         tree.evictable_full_device_leaves = {leaf}
         tree.evictable_full_host_leaves = set()
-        self._set_session_latest_ref(tree, "session-a", leaf)
+        self._set_session_latest_node(tree, "session-a", leaf)
 
         evicted_full, evicted_mamba = tree._evict_regular(leaf)
 
@@ -733,6 +756,8 @@ class TestMamba(unittest.TestCase):
         self.assertNotIn(leaf.key.child_key(tree.page_size), root.children)
 
     def test_hi_mamba_latest_session_insert_can_start_host_backup(self):
+        # Invariant: the optional backup-on-insert policy starts host backup for
+        # a committed latest-session terminal node.
         tree, root = self._make_minimal_hi_mamba_tree()
         leaf = TreeNode()
         leaf.parent = root
@@ -763,6 +788,8 @@ class TestMamba(unittest.TestCase):
         self.assertEqual(calls, [("write_backup", leaf, False)])
 
     def test_hi_mamba_evict_to_host_preserves_retention_priority(self):
+        # Invariant: device-to-host demotion changes residency but does not
+        # release latest-session retention while the node remains in the tree.
         tree, root = self._make_minimal_hi_mamba_tree()
         leaf = TreeNode()
         leaf.parent = root
@@ -796,20 +823,22 @@ class TestMamba(unittest.TestCase):
         tree.mamba_evictable_size_ = 1
         tree.evictable_full_device_leaves = {leaf}
         tree.evictable_full_host_leaves = set()
-        self._set_session_latest_ref(tree, "session-a", leaf)
+        self._set_session_latest_node(tree, "session-a", leaf)
 
         evicted_full, evicted_mamba = tree._evict_to_host(leaf)
 
         self.assertEqual((evicted_full, evicted_mamba), (1, 1))
         self.assertIs(tree.session_latest_nodes["session-a"], leaf)
-        self.assertIn("session-a", self._session_ids(leaf.latest_full_session_ids))
-        self.assertIn("session-a", self._session_ids(leaf.latest_mamba_session_ids))
+        self.assertEqual(leaf.latest_full_session_ids, {"session-a"})
+        self.assertEqual(leaf.latest_mamba_session_ids, {"session-a"})
 
-    def test_hi_mamba_device_mamba_eviction_prefers_stale_over_recency(self):
+    def test_hi_mamba_device_mamba_eviction_priority_order(self):
+        # Invariant: device Mamba eviction chooses stale Mamba states first,
+        # sessionless states second, and latest-session states last.
         tree, root = self._make_minimal_hi_mamba_tree()
-        latest = self._make_internal_node(root, 1, 10)
+        stale = self._make_internal_node(root, 1, 10)
         nonsession = self._make_internal_node(root, 2, 20)
-        stale = self._make_internal_node(root, 3, 30)
+        latest = self._make_internal_node(root, 3, 30)
 
         class RecordingMambaPool:
             def __init__(self):
@@ -827,22 +856,24 @@ class TestMamba(unittest.TestCase):
         tree.mamba_lru_list.insert_mru(latest)
         tree.mamba_lru_list.insert_mru(nonsession)
         tree.mamba_lru_list.insert_mru(stale)
-        self._set_session_latest_ref(tree, "session-a", latest)
+        self._set_session_latest_node(tree, "session-a", latest)
         nonsession.mamba_retained_by_nonsession = True
 
-        evicted = HiMambaRadixCache.evict_mamba(tree, 1)
+        evicted = HiMambaRadixCache.evict_mamba(tree, 2)
 
-        self.assertEqual(evicted, 1)
+        self.assertEqual(evicted, 2)
         self.assertIsNone(stale.mamba_value)
-        self.assertIsNotNone(nonsession.mamba_value)
+        self.assertIsNone(nonsession.mamba_value)
         self.assertIsNotNone(latest.mamba_value)
-        self.assertEqual(len(mamba_pool.freed), 1)
+        self.assertEqual(len(mamba_pool.freed), 2)
 
-    def test_hi_mamba_host_mamba_eviction_prefers_stale_over_recency(self):
+    def test_hi_mamba_host_mamba_eviction_priority_order(self):
+        # Invariant: host Mamba eviction uses the same retention ordering as
+        # device Mamba eviction.
         tree, root = self._make_minimal_hi_mamba_tree()
-        latest = self._make_internal_node(root, 1, 10)
+        stale = self._make_internal_node(root, 1, 10)
         nonsession = self._make_internal_node(root, 2, 20)
-        stale = self._make_internal_node(root, 3, 30)
+        latest = self._make_internal_node(root, 3, 30)
 
         class RecordingMambaHostPool:
             def __init__(self):
@@ -863,16 +894,16 @@ class TestMamba(unittest.TestCase):
         tree.mamba_host_lru_list.insert_mru(latest)
         tree.mamba_host_lru_list.insert_mru(nonsession)
         tree.mamba_host_lru_list.insert_mru(stale)
-        self._set_session_latest_ref(tree, "session-a", latest)
+        self._set_session_latest_node(tree, "session-a", latest)
         nonsession.mamba_retained_by_nonsession = True
 
-        evicted = HiMambaRadixCache.evict_mamba_host(tree, 1)
+        evicted = HiMambaRadixCache.evict_mamba_host(tree, 2)
 
-        self.assertEqual(evicted, 1)
+        self.assertEqual(evicted, 2)
         self.assertIsNone(stale.mamba_host_value)
-        self.assertIsNotNone(nonsession.mamba_host_value)
+        self.assertIsNone(nonsession.mamba_host_value)
         self.assertIsNotNone(latest.mamba_host_value)
-        self.assertEqual(len(tree.mamba_pool_host.freed), 1)
+        self.assertEqual(len(tree.mamba_pool_host.freed), 2)
 
     def test_mamba_pool_cpu_offload(self):
         """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""
